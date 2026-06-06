@@ -31,7 +31,7 @@ codex --version
 
 ```powershell
 # 방법 1 — 배치 스크립트 (python PATH 없어도 됨, 추천)
-run_pipeline.bat --task "로그인 버그 고쳐줘" --project "C:\Users\08seo\projects\AAU-niversity"
+./run_pipeline.bat --task "로그인 버그 고쳐줘" --project "C:\Users\08seo\projects\AAU-niversity"
 
 # 방법 2 — py 런처 직접 (python PATH 없어도 됨)
 py -3.11 actions/dual_agent_pipeline.py --task "..." --project <대상경로>
@@ -43,16 +43,16 @@ python actions/dual_agent_pipeline.py --task "..." --project <대상경로>
 주요 옵션:
 ```powershell
 # 토큰 소비 없이 명령/프롬프트 확인만 (파일 변경 없음, 먼저 이걸로 점검 추천)
-run_pipeline.bat --task "..." --project <대상경로> --dry-run
+./run_pipeline.bat --task "..." --project <대상경로> --dry-run
 
 # 단일 단계만
-run_pipeline.bat --only claude_plan --project <대상경로>
+./run_pipeline.bat --only claude_plan --project <대상경로>
 
 # 중간 단계부터 재개
-run_pipeline.bat --from-step codex_code_review --project <대상경로>
+./run_pipeline.bat --from-step codex_code_review --project <대상경로>
 
 # 이전 산출물 초기화 후 재실행 (task.md 는 유지)
-run_pipeline.bat --task "..." --project <대상경로> --reset
+./run_pipeline.bat --task "..." --project <대상경로> --reset
 ```
 
 ## 4. 결과물

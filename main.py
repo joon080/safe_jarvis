@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-safe_jarvis 파트 B — J.A.R.V.I.S 음성/텍스트 비서 (OpenAI 기반)
+safe_jarvis 파트 B — J.A.R.V.I.S 음성/텍스트 비서 (Gemini 기반)
 
 입력 3종:
-  1. 박수 두 번  → 마이크 활성화 → Whisper STT → GPT-4o
+  1. 박수 두 번  → 마이크 활성화 → Google STT → Gemini
   2. 텍스트 입력 (UI)
-  3. Voice 버튼 클릭 (UI) → 마이크 활성화 → Whisper STT
+  3. Voice 버튼 클릭 (UI) → 마이크 활성화 → Google STT → Gemini
 
 흐름:
-  입력 → GPT-4o(function calling) → tool 실행 → TTS 응답 → UI 로그
+  입력 → Gemini(function calling) → tool 실행 → TTS 응답 → UI 로그
 
 안전 원칙 (위험 기능 제거):
   - file_controller write/delete 없음
@@ -41,7 +41,6 @@ PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 PIPELINE_SCRIPT = BASE_DIR / "actions" / "dual_agent_pipeline.py"
 PIPELINE_CONFIG = BASE_DIR / "config" / "agent_pipeline.json"
 
-# Python 실행 파일 (번들 Python 우선, 없으면 py 런처, 없으면 python)
 def _find_python() -> str:
     candidates = [
         r"C:\Users\08seo\AppData\Local\Programs\Python\Python311\python.exe",
@@ -56,15 +55,14 @@ def _find_python() -> str:
 
 PYTHON_EXE = _find_python()
 
-
 # ---------------------------------------------------------------------------
-# imports — soft so startup doesn't crash if optional deps missing
+# soft imports
 # ---------------------------------------------------------------------------
 try:
-    import openai as _openai
-    _OPENAI_OK = True
+    import google.generativeai as genai
+    _GENAI_OK = True
 except ImportError:
-    _OPENAI_OK = False
+    _GENAI_OK = False
 
 try:
     import sounddevice as sd
@@ -74,6 +72,12 @@ except ImportError:
     _SD_OK = False
 
 try:
+    import speech_recognition as sr
+    _SR_OK = True
+except ImportError:
+    _SR_OK = False
+
+try:
     import pyttsx3 as _pyttsx3
     _TTS_OK = True
 except ImportError:
@@ -81,10 +85,10 @@ except ImportError:
 
 from ui import JarvisUI
 from memory.memory_manager import load_memory, update_memory, format_memory_for_prompt
-from actions.open_app       import open_app
-from actions.web_search     import web_search as web_search_action
-from actions.weather_report import weather_action
-from actions.reminder       import reminder
+from actions.open_app         import open_app
+from actions.web_search       import web_search as web_search_action
+from actions.weather_report   import weather_action
+from actions.reminder         import reminder
 from actions.screen_processor import screen_process
 
 try:
@@ -95,15 +99,13 @@ except ImportError:
 
 from listener.clap_listener import ClapListener
 
-
 # ---------------------------------------------------------------------------
 # API key + system prompt
 # ---------------------------------------------------------------------------
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["openai_api_key"]
-
+        return json.load(f)["gemini_api_key"]
 
 def _load_system_prompt() -> str:
     try:
@@ -114,10 +116,14 @@ def _load_system_prompt() -> str:
             "Be concise and always use tools to complete tasks."
         )
 
-
 # ---------------------------------------------------------------------------
 # TTS
 # ---------------------------------------------------------------------------
+
+# Set while TTS is actively playing, so the clap listener can ignore the mic
+# (otherwise speakers → mic feedback re-triggers detection).
+_SPEAKING = threading.Event()
+
 
 class _TTS:
     def __init__(self):
@@ -127,7 +133,6 @@ class _TTS:
             try:
                 self._engine = _pyttsx3.init()
                 self._engine.setProperty("rate", 175)
-                # Windows SAPI — prefer a male voice
                 voices = self._engine.getProperty("voices")
                 if voices:
                     male = next((v for v in voices if "david" in v.name.lower()), None)
@@ -142,13 +147,13 @@ class _TTS:
             return
         if ui:
             ui.set_state("SPEAKING")
+        _SPEAKING.set()
         try:
             if self._engine:
                 with self._lock:
                     self._engine.say(text)
                     self._engine.runAndWait()
             else:
-                # Windows SAPI via PowerShell fallback
                 ps_cmd = (
                     f"Add-Type -AssemblyName System.Speech; "
                     f"$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
@@ -162,32 +167,29 @@ class _TTS:
         except Exception as e:
             print(f"[TTS] error: {e}")
         finally:
+            _SPEAKING.clear()
             if ui and not ui.muted:
                 ui.set_state("LISTENING")
 
-
 _tts = _TTS()
 
-
 # ---------------------------------------------------------------------------
-# Audio recording (push-to-talk activated by clap or UI button)
+# Audio recording + STT
 # ---------------------------------------------------------------------------
 
 _SAMPLE_RATE   = 16000
-_SILENCE_THOLD = 0.008   # RMS threshold for speech detection
-_SILENCE_AFTER = 1.8     # seconds of silence to end recording
-_MAX_RECORD    = 30.0    # hard cap
-
+_SILENCE_THOLD = 0.008
+_SILENCE_AFTER = 1.8
+_MAX_RECORD    = 30.0
 
 def _record_until_silence(ui) -> bytes | None:
     if not _SD_OK:
         return None
-
     ui.set_state("LISTENING")
-    ui.write_log("SYS: 말씀하세요... (silence 후 자동 종료)")
+    ui.write_log("SYS: 말씀하세요...")
 
     chunks: list[bytes] = []
-    last_speech   = time.monotonic()
+    last_speech    = time.monotonic()
     started_speech = False
 
     def callback(indata, frames, time_info, status):
@@ -195,7 +197,7 @@ def _record_until_silence(ui) -> bytes | None:
         rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)) / 32768.0)
         chunks.append(indata.tobytes())
         if rms > _SILENCE_THOLD:
-            last_speech   = time.monotonic()
+            last_speech    = time.monotonic()
             started_speech = True
 
     try:
@@ -204,8 +206,7 @@ def _record_until_silence(ui) -> bytes | None:
             start = time.monotonic()
             while True:
                 time.sleep(0.05)
-                elapsed = time.monotonic() - start
-                if elapsed > _MAX_RECORD:
+                if time.monotonic() - start > _MAX_RECORD:
                     break
                 if started_speech and (time.monotonic() - last_speech) > _SILENCE_AFTER:
                     break
@@ -218,211 +219,171 @@ def _record_until_silence(ui) -> bytes | None:
     return b"".join(chunks)
 
 
-def _transcribe(audio_bytes: bytes, api_key: str) -> str | None:
-    if not _OPENAI_OK:
-        return None
-    try:
-        client = _openai.OpenAI(api_key=api_key)
-        with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as f:
-            raw_path = f.name
-            f.write(audio_bytes)
-
-        # convert raw PCM → wav via sounddevice/scipy or just send as-is
-        # OpenAI Whisper accepts .wav; build minimal WAV header
-        wav_path = raw_path + ".wav"
-        _write_wav(audio_bytes, wav_path)
-
-        with open(wav_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language="ko",
-            )
-        return result.text.strip()
-    except Exception as e:
-        print(f"[Whisper] error: {e}")
-        return None
-    finally:
-        try:
-            os.unlink(raw_path)
-            os.unlink(wav_path)
-        except Exception:
-            pass
-
-
 def _write_wav(pcm: bytes, path: str):
     import struct
-    num_channels   = 1
-    sample_rate    = _SAMPLE_RATE
-    bits_per_sample = 16
-    byte_rate      = sample_rate * num_channels * bits_per_sample // 8
-    block_align    = num_channels * bits_per_sample // 8
+    sr, ch, bps   = _SAMPLE_RATE, 1, 16
+    byte_rate      = sr * ch * bps // 8
+    block_align    = ch * bps // 8
     data_size      = len(pcm)
     header = struct.pack(
         "<4sI4s4sIHHIIHH4sI",
         b"RIFF", 36 + data_size, b"WAVE",
-        b"fmt ", 16, 1, num_channels, sample_rate,
-        byte_rate, block_align, bits_per_sample,
+        b"fmt ", 16, 1, ch, sr,
+        byte_rate, block_align, bps,
         b"data", data_size,
     )
     with open(path, "wb") as f:
         f.write(header + pcm)
 
 
+def _transcribe(audio_bytes: bytes) -> str | None:
+    if not _SR_OK:
+        return None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = f.name
+        _write_wav(audio_bytes, wav_path)
+
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+        return recognizer.recognize_google(audio_data, language="ko-KR")
+    except sr.UnknownValueError:
+        return None
+    except Exception as e:
+        print(f"[STT] error: {e}")
+        return None
+    finally:
+        try:
+            os.unlink(wav_path)
+        except Exception:
+            pass
+
 # ---------------------------------------------------------------------------
-# Tool declarations (safe subset)
+# Gemini tool declarations (dict 형식 — google.generativeai 호환)
 # ---------------------------------------------------------------------------
 
 TOOL_DECLARATIONS = [
     {
-        "type": "function",
-        "function": {
-            "name": "start_dual_agent_task",
-            "description": (
-                "Runs the Claude+Codex dual-agent development pipeline. "
-                "Use when the user asks to implement, fix, review, refactor, or debug code. "
-                "Also triggers on: 'dual agent mode', 'Claude랑 Codex로', '상호 검토', "
-                "'파이프라인으로 작업해'. "
-                "Claude plans and implements. Codex reviews and suggests fixes. "
-                "Final report is saved to .project-ai/final_report.md."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task": {
-                        "type": "string",
-                        "description": "The development task description"
-                    },
-                    "project_path": {
-                        "type": "string",
-                        "description": "Target project path. Leave empty to use config default."
-                    }
+        "name": "start_dual_agent_task",
+        "description": (
+            "Runs the Claude+Codex dual-agent development pipeline. "
+            "Use when the user asks to implement, fix, review, refactor, or debug code. "
+            "Also triggers on: 'dual agent mode', 'Claude랑 Codex로', '상호 검토', "
+            "'파이프라인으로 작업해'. "
+            "Claude plans and implements. Codex reviews and suggests fixes."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "task": {
+                    "type": "STRING",
+                    "description": "The development task description"
                 },
-                "required": ["task"]
-            }
+                "project_path": {
+                    "type": "STRING",
+                    "description": "Target project path. Leave empty to use config default."
+                }
+            },
+            "required": ["task"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "open_app",
-            "description": "Opens any application on the computer.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "app_name": {"type": "string", "description": "Application name"}
-                },
-                "required": ["app_name"]
-            }
+        "name": "open_app",
+        "description": "Opens any application on the computer.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "app_name": {"type": "STRING", "description": "Application name"}
+            },
+            "required": ["app_name"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Searches the web for information.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "mode":  {"type": "string", "description": "search or compare"},
-                },
-                "required": ["query"]
-            }
+        "name": "web_search",
+        "description": "Searches the web for information.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {"type": "STRING"},
+                "mode":  {"type": "STRING", "description": "search or compare"},
+            },
+            "required": ["query"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "weather_report",
-            "description": "Gets weather report for a city.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string"}
-                },
-                "required": ["city"]
-            }
+        "name": "weather_report",
+        "description": "Gets weather report for a city.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "city": {"type": "STRING"}
+            },
+            "required": ["city"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "reminder",
-            "description": "Sets a timed reminder.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date":    {"type": "string", "description": "YYYY-MM-DD"},
-                    "time":    {"type": "string", "description": "HH:MM (24h)"},
-                    "message": {"type": "string"}
-                },
-                "required": ["date", "time", "message"]
-            }
+        "name": "reminder",
+        "description": "Sets a timed reminder.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "date":    {"type": "STRING", "description": "YYYY-MM-DD"},
+                "time":    {"type": "STRING", "description": "HH:MM (24h)"},
+                "message": {"type": "STRING"}
+            },
+            "required": ["date", "time", "message"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "screen_process",
-            "description": "Captures and analyzes the screen or webcam.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "angle": {"type": "string", "description": "screen or camera"},
-                    "text":  {"type": "string", "description": "Question about the image"}
-                },
-                "required": ["text"]
-            }
+        "name": "screen_process",
+        "description": "Captures and analyzes the screen or webcam.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "angle": {"type": "STRING", "description": "screen or camera"},
+                "text":  {"type": "STRING", "description": "Question about the image"}
+            },
+            "required": ["text"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "save_memory",
-            "description": "Save a personal fact about the user to long-term memory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {"type": "string"},
-                    "key":      {"type": "string"},
-                    "value":    {"type": "string"}
-                },
-                "required": ["category", "key", "value"]
-            }
+        "name": "save_memory",
+        "description": "Save a personal fact about the user to long-term memory.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "category": {"type": "STRING"},
+                "key":      {"type": "STRING"},
+                "value":    {"type": "STRING"}
+            },
+            "required": ["category", "key", "value"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "shutdown_jarvis",
-            "description": "Shuts down the assistant when the user says goodbye.",
-            "parameters": {"type": "object", "properties": {}}
-        }
+        "name": "shutdown_jarvis",
+        "description": "Shuts down the assistant when the user says goodbye.",
+        "parameters": {"type": "OBJECT", "properties": {}}
     },
 ]
 
 if _YT_OK:
     TOOL_DECLARATIONS.append({
-        "type": "function",
-        "function": {
-            "name": "youtube_video",
-            "description": "Controls YouTube: play, summarize, trending.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "description": "play|summarize|get_info|trending"},
-                    "query":  {"type": "string"},
-                    "url":    {"type": "string"},
-                },
-                "required": []
-            }
+        "name": "youtube_video",
+        "description": "Controls YouTube: play, summarize, trending.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "play|summarize|get_info|trending"},
+                "query":  {"type": "STRING"},
+                "url":    {"type": "STRING"},
+            },
+            "required": []
         }
     })
 
-
 # ---------------------------------------------------------------------------
-# Main Jarvis class
+# SafeJarvis
 # ---------------------------------------------------------------------------
 
 class SafeJarvis:
@@ -430,17 +391,46 @@ class SafeJarvis:
     def __init__(self, ui: JarvisUI, api_key: str):
         self.ui      = ui
         self.api_key = api_key
-        self._client = _openai.OpenAI(api_key=api_key) if _OPENAI_OK else None
-        self._messages: list[dict] = []
+        self._history: list = []
         self._recording = threading.Event()
+        self._busy      = threading.Event()   # recording / thinking / speaking
         self._lock      = threading.Lock()
+        self._model     = None
 
-        # text command callback → thread-safe entry point
+        genai.configure(api_key=api_key)
         self.ui.on_text_command = self._on_text_command
 
-        # clap listener → start recording
-        self._clap = ClapListener(on_clap_detected=self._on_clap)
+        # Ignore claps while we're recording, processing, or speaking (TTS would
+        # otherwise be picked up by the mic and re-trigger detection).
+        self._clap = ClapListener(
+            on_clap_detected=self._on_clap,
+            is_busy=lambda: (self._busy.is_set()
+                             or self._recording.is_set()
+                             or _SPEAKING.is_set()),
+        )
         self._clap.start()
+
+    # Try current Gemini text models in order; skipped models fall through on 404.
+    _MODEL_CANDIDATES = [
+        "gemini-3.5-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash",
+    ]
+
+    def _get_model(self, system: str, model_name: str):
+        return genai.GenerativeModel(
+            model_name=model_name,
+            system_instruction=system,
+            tools=[{"function_declarations": TOOL_DECLARATIONS}],
+        )
+
+    def _is_model_not_found_error(self, exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "404" in msg
+            and "model" in msg
+            and ("not found" in msg or "not supported" in msg)
+        )
 
     # ------------------------------------------------------------------
     # Entry points
@@ -451,9 +441,8 @@ class SafeJarvis:
 
     def _on_clap(self):
         if self._recording.is_set():
-            return  # already recording
+            return
         self.ui.write_log("SYS: 박수 감지 — 마이크 활성화")
-        self.ui.set_state("LISTENING")
         threading.Thread(target=self._record_and_handle, daemon=True).start()
 
     def _record_and_handle(self):
@@ -464,7 +453,7 @@ class SafeJarvis:
             audio = _record_until_silence(self.ui)
             if audio:
                 self.ui.set_state("THINKING")
-                text = _transcribe(audio, self.api_key)
+                text = _transcribe(audio)
                 if text:
                     self.ui.write_log(f"You (음성): {text}")
                     self._handle_input(text)
@@ -476,21 +465,61 @@ class SafeJarvis:
             self._recording.clear()
 
     # ------------------------------------------------------------------
+    # 로컬 커맨드 라우터 — Gemini 호출 없이 바로 처리
+    # ------------------------------------------------------------------
+
+    # (패턴, tool명, args_builder)
+    _LOCAL_ROUTES = [
+        # "open X" / "X 열어" / "X 실행" / "launch X"
+        (r"(?:open|launch|start|실행|열어|켜줘|실행해)\s+(.+)", "open_app",
+         lambda m: {"app_name": m.group(1).strip()}),
+        # "X 날씨" / "날씨 X" / "weather X"
+        (r"(?:날씨\s+(.+)|(.+)\s+날씨|weather\s+(.+))", "weather_report",
+         lambda m: {"city": next(g for g in m.groups() if g)}),
+    ]
+
+    def _try_local_route(self, text: str) -> bool:
+        """로컬 라우터가 처리하면 True, 아니면 False."""
+        import re
+        for pattern, tool_name, args_fn in self._LOCAL_ROUTES:
+            m = re.search(pattern, text.strip(), re.IGNORECASE)
+            if m:
+                self.ui.write_log(f"[local] {tool_name} (Gemini 호출 없음)")
+                self.ui.set_state("THINKING")
+                result = self._execute_tool(tool_name, args_fn(m))
+                answer = f"Done: {result}" if result else "Done."
+                self.ui.write_log(f"Jarvis: {answer}")
+                threading.Thread(target=_tts.speak, args=(answer, self.ui), daemon=True).start()
+                return True
+        return False
+
+    # ------------------------------------------------------------------
     # Core reasoning loop
     # ------------------------------------------------------------------
 
     def _handle_input(self, text: str):
-        if not self._client:
-            self.ui.write_log("ERR: openai SDK 없음. pip install openai 실행 필요.")
+        if not _GENAI_OK:
+            self.ui.write_log("ERR: google-generativeai 없음. pip install google-generativeai")
+            return
+
+        self._busy.set()
+        try:
+            self._handle_input_inner(text)
+        finally:
+            self._busy.clear()
+
+    def _handle_input_inner(self, text: str):
+        # 단순 명령은 Gemini 쿼터 소비 없이 바로 처리
+        if self._try_local_route(text):
             return
 
         self.ui.set_state("THINKING")
 
         from datetime import datetime
-        memory    = load_memory()
-        mem_str   = format_memory_for_prompt(memory)
+        memory     = load_memory()
+        mem_str    = format_memory_for_prompt(memory)
         sys_prompt = _load_system_prompt()
-        now_str   = datetime.now().strftime("%A, %B %d, %Y — %I:%M %p")
+        now_str    = datetime.now().strftime("%A, %B %d, %Y — %I:%M %p")
 
         parts = [f"[현재 시각] {now_str}"]
         if mem_str:
@@ -498,71 +527,99 @@ class SafeJarvis:
         parts.append(sys_prompt)
         full_system = "\n\n".join(parts)
 
-        with self._lock:
-            self._messages.append({"role": "user", "content": text})
-            messages_snapshot = [
-                {"role": "system", "content": full_system}
-            ] + list(self._messages)
+        last_error = None
+        for model_name in self._MODEL_CANDIDATES:
+            try:
+                self.ui.write_log(f"SYS: Gemini model - {model_name}")
+                model = self._get_model(full_system, model_name)
+                with self._lock:
+                    history_snapshot = list(self._history)
+                chat = model.start_chat(history=history_snapshot)
+                self._run_completion_loop(chat, text)
+                return
+            except Exception as e:
+                last_error = e
+                if self._is_model_not_found_error(e):
+                    self.ui.write_log(f"SYS: Gemini model unavailable - {model_name}; trying next")
+                    continue
+                self.ui.write_log(f"ERR: {str(e)[:200]}")
+                traceback.print_exc()
+                if not self.ui.muted:
+                    self.ui.set_state("LISTENING")
+                return
 
-        try:
-            self._run_completion_loop(messages_snapshot)
-        except Exception as e:
-            err = f"ERR: {str(e)[:200]}"
-            self.ui.write_log(err)
-            traceback.print_exc()
-            if not self.ui.muted:
-                self.ui.set_state("LISTENING")
+        if last_error is not None:
+            self.ui.write_log(f"ERR: No Gemini model worked. Last error: {str(last_error)[:160]}")
+            traceback.print_exception(type(last_error), last_error, last_error.__traceback__)
+        if not self.ui.muted:
+            self.ui.set_state("LISTENING")
 
-    def _run_completion_loop(self, messages: list[dict]):
+    def _send_with_retry(self, chat, payload, max_retries: int = 3):
+        """429 quota exceeded 시 대기 후 재시도."""
+        for attempt in range(max_retries):
+            try:
+                return chat.send_message(payload)
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg or "quota" in msg.lower() or "RESOURCE_EXHAUSTED" in msg:
+                    wait = 30 * (attempt + 1)  # 30s, 60s, 90s
+                    self.ui.write_log(f"SYS: Gemini 쿼터 초과 — {wait}초 후 재시도 ({attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                else:
+                    raise
+        raise RuntimeError("Gemini quota exceeded after retries. 잠시 후 다시 시도하세요.")
+
+    def _run_completion_loop(self, chat, user_message: str):
+        response = self._send_with_retry(chat, user_message)
+
         max_iters = 6
         for _ in range(max_iters):
-            resp = self._client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages,
-                tools=TOOL_DECLARATIONS,
-                tool_choice="auto",
-            )
-            msg = resp.choices[0].message
+            # Gemini 응답에서 function_call 파트 추출
+            fc_parts = []
+            text_parts = []
+            for candidate in response.candidates:
+                for part in candidate.content.parts:
+                    if hasattr(part, "function_call") and part.function_call.name:
+                        fc_parts.append(part.function_call)
+                    elif hasattr(part, "text") and part.text:
+                        text_parts.append(part.text)
 
-            # no tool call → final answer
-            if not msg.tool_calls:
-                text = (msg.content or "").strip()
-                if text:
+            # 최종 텍스트 응답
+            if not fc_parts:
+                answer = " ".join(text_parts).strip()
+                if answer:
                     with self._lock:
-                        self._messages.append({"role": "assistant", "content": text})
-                    self.ui.write_log(f"Jarvis: {text}")
+                        self._history = list(chat.history)
+                    self.ui.write_log(f"Jarvis: {answer}")
                     threading.Thread(
-                        target=_tts.speak, args=(text, self.ui), daemon=True
+                        target=_tts.speak, args=(answer, self.ui), daemon=True
                     ).start()
                 else:
                     if not self.ui.muted:
                         self.ui.set_state("LISTENING")
                 return
 
-            # execute tool calls
-            messages.append(msg)
-            tool_results = []
-            for tc in msg.tool_calls:
-                result = self._execute_tool(tc.function.name, tc.function.arguments)
-                tool_results.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "content":      str(result),
-                })
-                self.ui.write_log(f"[tool] {tc.function.name} → {str(result)[:100]}")
+            # tool 실행 후 결과를 Gemini에 돌려보냄
+            fn_responses = []
+            for fc in fc_parts:
+                result = self._execute_tool(fc.name, dict(fc.args))
+                self.ui.write_log(f"[tool] {fc.name} → {str(result)[:100]}")
+                fn_responses.append(
+                    genai.protos.Part(
+                        function_response=genai.protos.FunctionResponse(
+                            name=fc.name,
+                            response={"result": str(result)}
+                        )
+                    )
+                )
 
-            messages.extend(tool_results)
+            response = self._send_with_retry(chat, fn_responses)
 
     # ------------------------------------------------------------------
-    # Tool execution (safe subset only)
+    # Tool execution
     # ------------------------------------------------------------------
 
-    def _execute_tool(self, name: str, args_json: str) -> str:
-        try:
-            args = json.loads(args_json or "{}")
-        except Exception:
-            args = {}
-
+    def _execute_tool(self, name: str, args: dict) -> str:
         print(f"[JARVIS] tool: {name}  args: {args}")
         self.ui.set_state("THINKING")
 
@@ -641,31 +698,55 @@ class SafeJarvis:
         env = dict(os.environ)
         env["PYTHONUTF8"] = "1"
 
+        # --- Popen: stream [pipeline] lines to UI in real-time ---------------
+        stderr_lines: list[str] = []
+        rc = -1
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=1800,
                 env=env,
             )
-        except subprocess.TimeoutExpired:
-            self.ui.set_state("LISTENING")
-            return "Pipeline timeout (30 min)."
+
+            # stderr reader thread — collects without blocking stdout loop
+            def _read_stderr():
+                for line in proc.stderr:
+                    stripped = line.rstrip()
+                    if stripped:
+                        stderr_lines.append(stripped)
+            stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+            stderr_thread.start()
+
+            # Stream stdout to UI line by line
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip()
+                if not line:
+                    continue
+                # Keep [pipeline] prefix — it tells the user which agent/step
+                self.ui.write_log(f"PIPE: {line}")
+
+            proc.stdout.close()
+            stderr_thread.join(timeout=5)
+            proc.stderr.close()
+            rc = proc.wait(timeout=10)
+
         except Exception as e:
-            self.ui.set_state("LISTENING")
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
             return f"Pipeline launch error: {e}"
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        if result.returncode != 0:
-            last_lines = "\n".join(result.stdout.strip().splitlines()[-6:])
-            return f"Pipeline failed (rc={result.returncode}).\n{last_lines}"
+        if rc != 0:
+            err_tail = "\n".join(stderr_lines[-4:]) if stderr_lines else "(stderr 없음)"
+            return f"Pipeline failed (rc={rc}).\n{err_tail}"
 
-        # Try to read final_report.md from the project's .project-ai/
+        # final_report.md 읽어서 반환
         try:
             cfg      = json.loads(PIPELINE_CONFIG.read_text(encoding="utf-8"))
             proj_dir = project_path or os.path.expandvars(cfg.get("project_root", ""))
@@ -685,9 +766,9 @@ class SafeJarvis:
 # ---------------------------------------------------------------------------
 
 def main():
-    if not _OPENAI_OK:
-        print("[ERROR] openai SDK 없음. 설치: pip install openai")
-        print("        파트 B(UI/음성) 실행 전에 requirements.txt 를 설치하세요.")
+    if not _GENAI_OK:
+        print("[ERROR] google-generativeai 없음.")
+        print("        py -3.11 -m pip install -r requirements.txt 실행 후 다시 시도하세요.")
         sys.exit(1)
 
     face_path = str(BASE_DIR / "mark_base" / "face.png")
