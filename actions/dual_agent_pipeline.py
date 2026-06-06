@@ -334,12 +334,14 @@ def main(argv=None) -> int:
     if full_run and task_text is None and not (workspace / "task.md").exists():
         raise SystemExit("[오류] --task 또는 --task-file 로 작업 지시를 주세요.")
 
-    init_workspace(workspace, task_text, reset=args.reset)
+    # dry-run 은 파일을 건드리지 않는다 (명령/프롬프트 미리보기만)
+    if not args.dry_run:
+        init_workspace(workspace, task_text, reset=args.reset)
 
     log(f"대상 프로젝트 : {project_root}")
     log(f"워크스페이스  : {workspace}")
     if args.dry_run:
-        log("모드: DRY-RUN (실제 호출 없음)")
+        log("모드: DRY-RUN (파일 변경 없음, 실제 호출 없음)")
 
     # 실행할 단계 선택
     steps = cfg["steps"]

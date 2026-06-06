@@ -1,0 +1,35 @@
+# safe_jarvis 파트 B — UI + 음성 + AI 비서
+# 설치: pip install -r requirements.txt
+# Python 3.11 필요 (py -3.11 -m pip install -r requirements.txt)
+
+# Core AI
+openai>=1.30.0
+
+# GUI
+PyQt6>=6.6.0
+
+# 오디오 (STT 녹음 + 박수감지)
+sounddevice>=0.4.6
+numpy>=1.24
+
+# TTS (오프라인, 선택)
+pyttsx3>=2.90
+
+# 시스템 모니터링 (UI 좌측 패널)
+psutil>=5.9
+
+# 이미지 처리 (HUD 얼굴 이미지)
+Pillow>=10.0
+
+# 웹 검색 / 날씨
+requests>=2.31
+beautifulsoup4>=4.12
+duckduckgo-search>=6.0
+
+# 화면 캡처 (screen_process)
+mss>=9.0
+opencv-python>=4.9
+numpy>=1.24  # 중복이어도 무방
+
+# YouTube 요약 (선택)
+youtube-transcript-api>=0.6
