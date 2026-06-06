@@ -31,7 +31,7 @@ codex --version
 
 ```powershell
 # 방법 1 — 배치 스크립트 (python PATH 없어도 됨, 추천)
-./run_pipeline.bat --task "로그인 버그 고쳐줘" --project "C:\Users\08seo\projects\AAU-niversity"
+./run_pipeline.bat --task "로그인 버그 고쳐줘" --project "C:\projects\my-project"
 
 # 방법 2 — py 런처 직접 (python PATH 없어도 됨)
 py -3.11 actions/dual_agent_pipeline.py --task "..." --project <대상경로>

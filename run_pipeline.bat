@@ -3,7 +3,7 @@
 :: python 이 PATH 에 없어도 Windows py 런처(py.exe)로 실행한다.
 ::
 :: 사용 예:
-::   run_pipeline.bat --task "로그인 버그 고쳐줘" --project "C:\Users\08seo\projects\AAU-niversity"
+::   run_pipeline.bat --task "로그인 버그 고쳐줘" --project "C:\projects\my-project"
 ::   run_pipeline.bat --task "..." --project <경로> --dry-run
 ::   run_pipeline.bat --only claude_plan --project <경로>
 

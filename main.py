@@ -3,10 +3,10 @@
 """
 safe_jarvis 파트 B — J.A.R.V.I.S 음성/텍스트 비서 (Gemini 기반)
 
-입력 3종:
+입력 2종:
   1. 박수 두 번  → 마이크 활성화 → Google STT → Gemini
   2. 텍스트 입력 (UI)
-  3. Voice 버튼 클릭 (UI) → 마이크 활성화 → Google STT → Gemini
+  (UI의 마이크 버튼은 음소거 토글 전용 — 녹음 시작 아님)
 
 흐름:
   입력 → Gemini(function calling) → tool 실행 → TTS 응답 → UI 로그
@@ -42,8 +42,11 @@ PIPELINE_SCRIPT = BASE_DIR / "actions" / "dual_agent_pipeline.py"
 PIPELINE_CONFIG = BASE_DIR / "config" / "agent_pipeline.json"
 
 def _find_python() -> str:
+    # Try the standard per-user install location dynamically (%LOCALAPPDATA%)
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    local_py  = str(Path(local_app) / "Programs" / "Python" / "Python311" / "python.exe") if local_app else ""
     candidates = [
-        r"C:\Users\08seo\AppData\Local\Programs\Python\Python311\python.exe",
+        local_py,
         shutil.which("py") or "",
         shutil.which("python") or "",
         "python",
@@ -699,6 +702,8 @@ class SafeJarvis:
         env["PYTHONUTF8"] = "1"
 
         # --- Popen: stream [pipeline] lines to UI in real-time ---------------
+        _PIPELINE_TIMEOUT = 1800  # 30 min hard limit (same as before)
+
         stderr_lines: list[str] = []
         rc = -1
         try:
@@ -712,27 +717,45 @@ class SafeJarvis:
                 env=env,
             )
 
-            # stderr reader thread — collects without blocking stdout loop
-            def _read_stderr():
-                for line in proc.stderr:
-                    stripped = line.rstrip()
-                    if stripped:
-                        stderr_lines.append(stripped)
-            stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
-            stderr_thread.start()
+            # Watchdog thread: kill process if it hangs past the hard timeout.
+            # Without this, a stalled claude/codex subprocess would block the
+            # stdout-reading loop forever, keeping _busy set and locking
+            # clap/voice input for the rest of the session.
+            def _watchdog():
+                self.ui.write_log(
+                    f"PIPE: [timeout] {_PIPELINE_TIMEOUT//60}분 초과 — 프로세스 강제 종료"
+                )
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            watchdog = threading.Timer(_PIPELINE_TIMEOUT, _watchdog)
+            watchdog.start()
 
-            # Stream stdout to UI line by line
-            for raw_line in proc.stdout:
-                line = raw_line.rstrip()
-                if not line:
-                    continue
-                # Keep [pipeline] prefix — it tells the user which agent/step
-                self.ui.write_log(f"PIPE: {line}")
+            try:
+                # stderr reader thread — collects without blocking stdout loop
+                def _read_stderr():
+                    for line in proc.stderr:
+                        stripped = line.rstrip()
+                        if stripped:
+                            stderr_lines.append(stripped)
+                stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+                stderr_thread.start()
 
-            proc.stdout.close()
-            stderr_thread.join(timeout=5)
-            proc.stderr.close()
-            rc = proc.wait(timeout=10)
+                # Stream stdout to UI line by line
+                for raw_line in proc.stdout:
+                    line = raw_line.rstrip()
+                    if not line:
+                        continue
+                    # Keep [pipeline] prefix — it tells the user which agent/step
+                    self.ui.write_log(f"PIPE: {line}")
+
+                proc.stdout.close()
+                stderr_thread.join(timeout=5)
+                proc.stderr.close()
+                rc = proc.wait(timeout=10)
+            finally:
+                watchdog.cancel()  # disarm if process finished normally
 
         except Exception as e:
             if not self.ui.muted:

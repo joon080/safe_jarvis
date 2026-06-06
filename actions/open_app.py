@@ -1,3 +1,4 @@
+import os
 import time
 import subprocess
 import platform
@@ -78,12 +79,13 @@ def _normalize(raw: str) -> str:
     return raw  
 
 def _launch_windows(app_name: str) -> bool:
-
-    if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
+    # Resolve to an absolute path first; never pass raw user/model string to
+    # shell=True — that allows shell injection (e.g. "calc.exe & del /f ...").
+    exe = shutil.which(app_name) or shutil.which(app_name.split(".")[0])
+    if exe:
         try:
             subprocess.Popen(
-                app_name,
-                shell=True,
+                [exe],          # list form → shell=False (default), no injection
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -92,9 +94,11 @@ def _launch_windows(app_name: str) -> bool:
         except Exception as e:
             print(f"[open_app] subprocess failed: {e}")
 
+    # URI / protocol handler (ms-settings:, mailto:, etc.) — os.startfile is
+    # safe here: it does NOT invoke cmd.exe and only handles registered schemes.
     if ":" in app_name:
         try:
-            subprocess.Popen(f"start {app_name}", shell=True)
+            os.startfile(app_name)
             time.sleep(1.0)
             return True
         except Exception:

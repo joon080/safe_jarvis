@@ -4,6 +4,12 @@
 # 파이프라인 실행 로그
 .project-ai/_runs/
 
+# 개인 개발 노트 (로컬 경로·내부 설계 메모 포함)
+CLAUDE.md
+
+# 진단/테스트 스크립트 (로컬 임시 파일)
+mike_test.py
+
 # 비밀/설정
 config/api_keys.json
 .env

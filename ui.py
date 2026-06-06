@@ -1279,7 +1279,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(_sec("COMMAND INPUT"))
         lay.addLayout(self._build_input_row())
 
-        self._mute_btn = QPushButton("🎙  MICROPHONE ACTIVE")
+        self._mute_btn = QPushButton("🎙  MIC ON  [click to mute]")
         self._mute_btn.setFixedHeight(30)
         self._mute_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         self._mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1384,7 +1384,7 @@ class MainWindow(QMainWindow):
 
     def _style_mute_btn(self):
         if self._muted:
-            self._mute_btn.setText("🔇  MICROPHONE MUTED")
+            self._mute_btn.setText("🔇  MIC MUTED  [click to unmute]")
             self._mute_btn.setStyleSheet(f"""
                 QPushButton {{
                     background: #140006; color: {C.MUTED_C};
@@ -1392,7 +1392,7 @@ class MainWindow(QMainWindow):
                 }}
             """)
         else:
-            self._mute_btn.setText("🎙  MICROPHONE ACTIVE")
+            self._mute_btn.setText("🎙  MIC ON  [click to mute]")
             self._mute_btn.setStyleSheet(f"""
                 QPushButton {{
                     background: #00140a; color: {C.GREEN};
