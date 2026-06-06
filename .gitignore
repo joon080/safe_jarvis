@@ -1,0 +1,18 @@
+# Mark-XXXIX 원본 (참고용, 업스트림 코드 — 통째로 커밋하지 않음)
+/mark_base/
+
+# 파이프라인 실행 로그
+.project-ai/_runs/
+
+# 비밀/설정
+config/api_keys.json
+.env
+.env.*
+secrets.json
+credentials.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

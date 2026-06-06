@@ -1,0 +1,81 @@
+{
+  "_comment": "safe_jarvis 파트 A — Claude↔Codex dual-agent 파이프라인 설정. project_root는 작업 대상 프로젝트 경로. CLI --project 로 덮어쓸 수 있음.",
+
+  "project_root": "C:\\Users\\%USERNAME%\\projects\\sample-project",
+  "workspace_dir": ".project-ai",
+  "allowed_base_path": "C:\\Users\\%USERNAME%\\projects",
+
+  "agents": {
+    "claude": {
+      "command": "claude",
+      "model": "",
+      "read_args": ["-p", "--add-dir", "{project_root}"],
+      "edit_args": ["-p", "--add-dir", "{project_root}", "--permission-mode", "bypassPermissions"]
+    },
+    "codex": {
+      "command": "codex",
+      "model": "",
+      "review_args": ["exec", "--cd", "{project_root}", "--skip-git-repo-check", "-s", "read-only", "-o", "{output_path}"],
+      "check_args": ["exec", "--cd", "{project_root}", "--skip-git-repo-check", "-s", "workspace-write", "-o", "{output_path}"]
+    }
+  },
+
+  "claude_disallowed_tools": [
+    "Bash(git commit:*)",
+    "Bash(git push:*)",
+    "Bash(git reset:*)",
+    "Bash(rm:*)",
+    "Bash(del:*)",
+    "Bash(rmdir:*)",
+    "Bash(shutdown:*)",
+    "Bash(format:*)"
+  ],
+
+  "steps": [
+    {"id": "claude_plan",          "agent": "claude", "mode": "read",   "prompt": "prompts/claude_plan_prompt.txt",           "inputs": ["task.md"],                                                                                                  "output": "claude_plan.md"},
+    {"id": "codex_plan_review",    "agent": "codex",  "mode": "review", "prompt": "prompts/codex_plan_review_prompt.txt",     "inputs": ["task.md", "claude_plan.md"],                                                                                "output": "codex_plan_review.md"},
+    {"id": "claude_implementation","agent": "claude", "mode": "edit",   "prompt": "prompts/claude_implementation_prompt.txt", "inputs": ["task.md", "claude_plan.md", "codex_plan_review.md"],                                                        "output": "claude_implementation_log.md"},
+    {"id": "codex_code_review",    "agent": "codex",  "mode": "review", "prompt": "prompts/codex_code_review_prompt.txt",     "inputs": ["task.md", "claude_plan.md", "codex_plan_review.md", "claude_implementation_log.md"],                         "output": "codex_code_review.md"},
+    {"id": "claude_fix",          "agent": "claude", "mode": "edit",   "prompt": "prompts/claude_fix_prompt.txt",            "inputs": ["codex_code_review.md", "claude_implementation_log.md"],                                                      "output": "claude_fix_log.md"},
+    {"id": "codex_final_check",    "agent": "codex",  "mode": "check",  "prompt": "prompts/codex_final_check_prompt.txt",     "inputs": ["task.md", "claude_implementation_log.md", "codex_code_review.md", "claude_fix_log.md"],                       "output": "codex_final_check.md"},
+    {"id": "final_report",        "agent": "claude", "mode": "read",   "prompt": "prompts/final_report_prompt.txt",          "inputs": ["task.md", "claude_plan.md", "codex_plan_review.md", "claude_implementation_log.md", "codex_code_review.md", "claude_fix_log.md", "codex_final_check.md"], "output": "final_report.md"}
+  ],
+
+  "execution": {
+    "stop_on_failure": true,
+    "wait_between_steps": false,
+    "timeout_seconds": 1800,
+    "require_user_approval_before_commit": true,
+    "allow_auto_fix_by_codex": false,
+    "allow_push": false,
+    "allow_deploy": false
+  },
+
+  "checks": {
+    "build_command": "npm run build",
+    "test_command": "npm test",
+    "lint_command": "npm run lint"
+  },
+
+  "blocked_files": [
+    ".env",
+    ".env.local",
+    ".env.production",
+    "api_keys.json",
+    "secrets.json",
+    "credentials.json"
+  ],
+
+  "blocked_actions": [
+    "send_email",
+    "send_message",
+    "make_payment",
+    "change_account_settings",
+    "read_browser_passwords",
+    "delete_project",
+    "delete_user_files",
+    "shutdown",
+    "restart",
+    "format_disk"
+  ]
+}
