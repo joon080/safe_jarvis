@@ -153,7 +153,8 @@ def build_command(step: dict, cfg: dict, project_root: Path, output_path: Path) 
 # 컨텍스트(입력 파일) 구성
 # ---------------------------------------------------------------------------
 
-def build_prompt(step: dict, cfg: dict, project_root: Path, workspace: Path) -> str:
+def build_prompt(step: dict, cfg: dict, project_root: Path, workspace: Path,
+                 task_override: str | None = None) -> str:
     template_path = BASE_DIR / step["prompt"]
     template = template_path.read_text(encoding="utf-8")
 
@@ -166,7 +167,12 @@ def build_prompt(step: dict, cfg: dict, project_root: Path, workspace: Path) -> 
 
     for fname in step.get("inputs", []):
         fpath = workspace / fname
-        if fpath.exists():
+        # task.md: prefer the in-memory --task/--task-file text so that
+        # dry-run (which skips init_workspace) still previews the REAL task,
+        # not a stale scaffold task.md left over from a previous run.
+        if fname == "task.md" and task_override is not None:
+            content = task_override
+        elif fpath.exists():
             content = fpath.read_text(encoding="utf-8", errors="replace")
         else:
             content = "(파일 없음 — 아직 생성되지 않음)"
@@ -186,18 +192,22 @@ def build_prompt(step: dict, cfg: dict, project_root: Path, workspace: Path) -> 
 # ---------------------------------------------------------------------------
 
 def run_step(step: dict, cfg: dict, project_root: Path, workspace: Path,
-             runs_dir: Path, timeout: int, dry_run: bool) -> bool:
+             runs_dir: Path, timeout: int, dry_run: bool,
+             task_override: str | None = None) -> bool:
     sid = step["id"]
     agent = step["agent"]
     output_path = workspace / step["output"]
     cmd = build_command(step, cfg, project_root, output_path)
-    prompt = build_prompt(step, cfg, project_root, workspace)
+    prompt = build_prompt(step, cfg, project_root, workspace, task_override)
 
     log(f"── 단계: {sid}  (agent={agent}, mode={step['mode']})")
     log(f"   명령: {' '.join(cmd)}")
 
     if dry_run:
-        preview = prompt if len(prompt) < 600 else prompt[:600] + " …(생략)"
+        # 2000 chars so the task.md block (which follows the template + context
+        # header, past ~600 chars) is actually visible in the preview.
+        _LIMIT = 2000
+        preview = prompt if len(prompt) < _LIMIT else prompt[:_LIMIT] + " …(생략)"
         log(f"   [dry-run] 프롬프트 미리보기:\n{preview}\n")
         return True
 
@@ -362,7 +372,8 @@ def main(argv=None) -> int:
 
     results = []
     for step in steps:
-        ok = run_step(step, cfg, project_root, workspace, runs_dir, timeout, args.dry_run)
+        ok = run_step(step, cfg, project_root, workspace, runs_dir, timeout,
+                      args.dry_run, task_override=task_text)
         results.append((step["id"], ok))
         if not ok and stop_on_failure and not args.dry_run:
             log(f"중단: '{step['id']}' 실패, stop_on_failure=true")

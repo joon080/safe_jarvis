@@ -41,9 +41,12 @@ except Exception:
     _SD_OK = False
 
 # --- detection tuning -------------------------------------------------------
-# Absolute peak floor (normalized 0..1). Above measured noise peak (~0.0023),
-# below the weaker claps (~0.025). Catches claps, rejects background.
-_PEAK_THRESHOLD = 0.05
+# Absolute peak floor (normalized 0..1). Measured on this mic: noise peak
+# ~0.0023, claps 0.025~0.13. 0.03 sits ~13x above noise and catches normal
+# claps. Trade-off: lower (→0.02) catches very soft claps but lets keyboard/
+# desk taps through more; raise (→0.05) is stricter but misses soft claps.
+# The crest-over-background check below adds a second line of defense.
+_PEAK_THRESHOLD = 0.03
 # A clap's peak must exceed this multiple of the running background RMS.
 # Idle clap: peak/baseline is huge → passes. Speech: baseline rises → fails.
 _CREST_OVER_BG  = 6.0
