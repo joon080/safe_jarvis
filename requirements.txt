@@ -15,7 +15,8 @@ numpy>=1.24
 # STT (Google Web Speech API, 무료)
 SpeechRecognition>=3.10
 
-# TTS (오프라인)
+# TTS (EdgeTTS = 온라인, 한국어/영어 고품질 / pyttsx3 = 오프라인 폴백)
+edge-tts>=7.0
 pyttsx3>=2.90
 
 # 시스템 모니터링 (UI 좌측 패널)

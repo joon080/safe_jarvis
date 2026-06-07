@@ -127,11 +127,28 @@ def _load_system_prompt() -> str:
 # (otherwise speakers → mic feedback re-triggers detection).
 _SPEAKING = threading.Event()
 
+# EdgeTTS (online, high quality, Korean-capable). Male voices to match JARVIS.
+try:
+    import asyncio
+    import edge_tts as _edge_tts
+    _EDGE_OK = True
+except ImportError:
+    _EDGE_OK = False
+
+_EDGE_VOICE_KO = "ko-KR-InJoonNeural"   # Korean male
+_EDGE_VOICE_EN = "en-US-GuyNeural"      # English male
+
+
+def _has_korean(text: str) -> bool:
+    return any("가" <= ch <= "힣" for ch in text)
+
 
 class _TTS:
     def __init__(self):
         self._engine = None
         self._lock   = threading.Lock()
+        # pyttsx3 is kept only as an offline fallback (often fails on Windows
+        # with "Class not registered"); EdgeTTS is the primary path.
         if _TTS_OK:
             try:
                 self._engine = _pyttsx3.init()
@@ -152,27 +169,76 @@ class _TTS:
             ui.set_state("SPEAKING")
         _SPEAKING.set()
         try:
-            if self._engine:
-                with self._lock:
-                    self._engine.say(text)
-                    self._engine.runAndWait()
-            else:
-                ps_cmd = (
-                    f"Add-Type -AssemblyName System.Speech; "
-                    f"$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-                    f"$s.Speak([System.Text.RegularExpressions.Regex]::Replace("
-                    f"'{text.replace(chr(39),'')}','[^\\x20-\\x7E]',''))"
-                )
-                subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", ps_cmd],
-                    timeout=30, capture_output=True
-                )
+            with self._lock:
+                if _EDGE_OK and self._speak_edge(text):
+                    return
+                self._speak_fallback(text)
         except Exception as e:
             print(f"[TTS] error: {e}")
         finally:
             _SPEAKING.clear()
             if ui and not ui.muted:
                 ui.set_state("LISTENING")
+
+    def _speak_edge(self, text: str) -> bool:
+        """Synthesize via EdgeTTS → temp mp3 → play. Returns False on failure
+        (e.g. no internet) so the caller can fall back."""
+        path = None
+        try:
+            voice = _EDGE_VOICE_KO if _has_korean(text) else _EDGE_VOICE_EN
+            fd, path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+
+            async def _gen():
+                await _edge_tts.Communicate(text, voice).save(path)
+            asyncio.run(_gen())
+
+            if os.path.getsize(path) == 0:
+                return False
+            self._play_mp3(path)
+            return True
+        except Exception as e:
+            print(f"[TTS] edge-tts failed → fallback: {e}")
+            return False
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _play_mp3(path: str):
+        """Play an mp3 using the Windows built-in MCI (no extra dependency)."""
+        from ctypes import windll
+        alias = "safejarvis_tts"
+
+        def mci(cmd: str):
+            windll.winmm.mciSendStringW(cmd, None, 0, None)
+
+        mci(f'open "{path}" type mpegvideo alias {alias}')
+        try:
+            mci(f"play {alias} wait")   # blocks until playback finishes
+        finally:
+            mci(f"close {alias}")
+
+    def _speak_fallback(self, text: str):
+        """Offline fallback: pyttsx3, else PowerShell System.Speech."""
+        if self._engine:
+            self._engine.say(text)
+            self._engine.runAndWait()
+            return
+        # PowerShell System.Speech: keep Korean/Unicode (no ASCII stripping).
+        safe = text.replace("'", "")
+        ps_cmd = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"$s.Speak('{safe}')"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            timeout=30, capture_output=True,
+        )
 
 _tts = _TTS()
 
