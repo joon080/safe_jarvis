@@ -101,6 +101,7 @@ except ImportError:
     _YT_OK = False
 
 from listener.clap_listener import ClapListener
+from listener.wake_listener import WakeListener
 
 # ---------------------------------------------------------------------------
 # API key + system prompt
@@ -469,15 +470,28 @@ class SafeJarvis:
         genai.configure(api_key=api_key)
         self.ui.on_text_command = self._on_text_command
 
-        # Ignore claps while we're recording, processing, or speaking (TTS would
-        # otherwise be picked up by the mic and re-trigger detection).
+        # Shared busy guard — ignore clap/wake while recording, processing, or
+        # speaking (mic would otherwise pick up TTS / our own voice).
+        _busy_guard = lambda: (self._busy.is_set()
+                               or self._recording.is_set()
+                               or _SPEAKING.is_set())
+
         self._clap = ClapListener(
             on_clap_detected=self._on_clap,
-            is_busy=lambda: (self._busy.is_set()
-                             or self._recording.is_set()
-                             or _SPEAKING.is_set()),
+            is_busy=_busy_guard,
         )
         self._clap.start()
+
+        # "Hey Jarvis" wake word (offline, no key — openWakeWord).
+        self._wake = WakeListener(
+            on_wake_detected=self._on_wake,
+            is_busy=_busy_guard,
+        )
+        if self._wake.available():
+            self._wake.start()
+            self.ui.write_log('SYS: wake word 활성화 — 박수 또는 "Hey Jarvis"로 호출')
+        else:
+            self.ui.write_log("SYS: wake word 비활성화 (모델 로드 실패) — 박수로 호출")
 
     # Try current Gemini text models in order; skipped models fall through on 404.
     _MODEL_CANDIDATES = [
@@ -512,6 +526,12 @@ class SafeJarvis:
         if self._recording.is_set():
             return
         self.ui.write_log("SYS: 박수 감지 — 마이크 활성화")
+        threading.Thread(target=self._record_and_handle, daemon=True).start()
+
+    def _on_wake(self):
+        if self._recording.is_set():
+            return
+        self.ui.write_log('SYS: "Jarvis" 감지 — 마이크 활성화')
         threading.Thread(target=self._record_and_handle, daemon=True).start()
 
     def _record_and_handle(self):
