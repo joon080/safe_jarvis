@@ -180,6 +180,27 @@ def build_prompt(step: dict, cfg: dict, project_root: Path, workspace: Path,
         blocks.append(content.rstrip())
         blocks.append("")
 
+    # 보안 규칙 — config 의 blocked_files/blocked_actions 를 실제로 주입한다.
+    blocked_files = cfg.get("blocked_files") or []
+    blocked_actions = cfg.get("blocked_actions") or []
+    if blocked_files or blocked_actions:
+        blocks.append("=== 보안 규칙 (오케스트레이터 자동 첨부, 위반 금지) ===")
+        if blocked_files:
+            blocks.append("다음 파일은 절대 읽거나, 출력하거나, 수정하지 마라: "
+                          + ", ".join(blocked_files))
+        if blocked_actions:
+            blocks.append("다음 행위는 절대 하지 마라: " + ", ".join(blocked_actions))
+        blocks.append(f"PROJECT_ROOT({project_root}) 밖의 파일은 읽거나 수정하지 마라.")
+        blocks.append("")
+
+    # 검증 명령 — 빌드/테스트를 실행하는 단계(codex_final_check)에 전달.
+    checks = cfg.get("checks") or {}
+    if checks and step["id"] == "codex_final_check":
+        blocks.append("이 프로젝트의 검증 명령 (config 설정값 — 존재할 때만 실행):")
+        for name, command in checks.items():
+            blocks.append(f"- {name}: {command}")
+        blocks.append("")
+
     blocks.append(
         f"위 지시에 따라 작업하고, 결과 markdown 을 응답으로 출력하라. "
         f"이 출력은 오케스트레이터가 {cfg['workspace_dir']}/{step['output']} 에 저장한다."

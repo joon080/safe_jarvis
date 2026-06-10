@@ -93,6 +93,7 @@ from actions.web_search       import web_search as web_search_action
 from actions.weather_report   import weather_action
 from actions.reminder         import reminder
 from actions.screen_processor import screen_process
+from actions import screen_processor as _vision
 
 try:
     from actions.youtube_video import youtube_video as _youtube
@@ -371,14 +372,21 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "web_search",
-        "description": "Searches the web for information.",
+        "description": (
+            "Searches the web for information. "
+            "For comparing multiple things, set mode='compare' and fill 'items'/'aspect'."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "query": {"type": "STRING"},
-                "mode":  {"type": "STRING", "description": "search or compare"},
+                "query":  {"type": "STRING", "description": "Search query (search mode)"},
+                "mode":   {"type": "STRING", "description": "'search' or 'compare'"},
+                "items":  {"type": "ARRAY", "items": {"type": "STRING"},
+                           "description": "Compare mode: the things to compare"},
+                "aspect": {"type": "STRING",
+                           "description": "Compare mode: what aspect to compare (e.g. price, performance)"},
             },
-            "required": ["query"]
+            "required": []
         }
     },
     {
@@ -466,15 +474,19 @@ class SafeJarvis:
         self._busy      = threading.Event()   # recording / thinking / speaking
         self._lock      = threading.Lock()
         self._model     = None
+        # 마지막으로 성공한 모델 — 다음 요청부터 404 후보를 다시 돌지 않는다.
+        self._preferred_model: str | None = None
 
         genai.configure(api_key=api_key)
         self.ui.on_text_command = self._on_text_command
 
-        # Shared busy guard — ignore clap/wake while recording, processing, or
-        # speaking (mic would otherwise pick up TTS / our own voice).
+        # Shared busy guard — ignore clap/wake while recording, processing,
+        # speaking, or while vision audio is playing (mic would otherwise pick
+        # up TTS / our own voice).
         _busy_guard = lambda: (self._busy.is_set()
                                or self._recording.is_set()
-                               or _SPEAKING.is_set())
+                               or _SPEAKING.is_set()
+                               or _vision.PLAYING.is_set())
 
         self._clap = ClapListener(
             on_clap_detected=self._on_clap,
@@ -558,28 +570,46 @@ class SafeJarvis:
     # ------------------------------------------------------------------
 
     # (패턴, tool명, args_builder)
+    # 전체 문장이 패턴과 정확히 일치할 때만 라우팅 (fullmatch) — 긴 문장은 Gemini로.
     _LOCAL_ROUTES = [
-        # "open X" / "X 열어" / "X 실행" / "launch X"
-        (r"(?:open|launch|start|실행|열어|켜줘|실행해)\s+(.+)", "open_app",
+        # 영어: 동사 + 앱 ("open chrome", "launch vscode")
+        (r"(?:open|launch|start)\s+(.+)", "open_app",
          lambda m: {"app_name": m.group(1).strip()}),
-        # "X 날씨" / "날씨 X" / "weather X"
-        (r"(?:날씨\s+(.+)|(.+)\s+날씨|weather\s+(.+))", "weather_report",
-         lambda m: {"city": next(g for g in m.groups() if g)}),
+        # 한국어: 앱 + 동사 ("크롬 열어줘", "VS Code 실행해 줘", "메모장 켜줘")
+        (r"(.+?)\s*(?:열어|켜|띄워|실행\s*해|실행\s*시켜)\s*줘?", "open_app",
+         lambda m: {"app_name": m.group(1).strip()}),
+        # "날씨 서울" / "weather (in) seoul"
+        (r"(?:날씨|weather(?:\s+in)?)\s+(.+)", "weather_report",
+         lambda m: {"city": m.group(1).strip()}),
+        # 한국어: 도시 + 날씨 ("서울 날씨", "부산 날씨 알려줘", "서울 날씨 어때")
+        (r"(.+?)\s*(?:의\s*)?날씨\s*(?:는|좀)?\s*(?:알려\s*줘?|어때\??|보여\s*줘?)?", "weather_report",
+         lambda m: {"city": m.group(1).strip()}),
     ]
+
+    # 캡처된 인자가 이보다 길면 단순 명령이 아니라고 보고 Gemini로 넘긴다.
+    _LOCAL_ARG_MAX_CHARS = 25
+    _LOCAL_ARG_MAX_WORDS = 4
 
     def _try_local_route(self, text: str) -> bool:
         """로컬 라우터가 처리하면 True, 아니면 False."""
         import re
         for pattern, tool_name, args_fn in self._LOCAL_ROUTES:
-            m = re.search(pattern, text.strip(), re.IGNORECASE)
-            if m:
-                self.ui.write_log(f"[local] {tool_name} (Gemini 호출 없음)")
-                self.ui.set_state("THINKING")
-                result = self._execute_tool(tool_name, args_fn(m))
-                answer = f"Done: {result}" if result else "Done."
-                self.ui.write_log(f"Jarvis: {answer}")
-                threading.Thread(target=_tts.speak, args=(answer, self.ui), daemon=True).start()
-                return True
+            m = re.fullmatch(pattern, text.strip(), re.IGNORECASE)
+            if not m:
+                continue
+            args = args_fn(m)
+            arg  = next(iter(args.values()), "")
+            if (not arg
+                    or len(arg) > self._LOCAL_ARG_MAX_CHARS
+                    or len(arg.split()) > self._LOCAL_ARG_MAX_WORDS):
+                continue
+            self.ui.write_log(f"[local] {tool_name} (Gemini 호출 없음)")
+            self.ui.set_state("THINKING")
+            result = self._execute_tool(tool_name, args)
+            answer = f"Done: {result}" if result else "Done."
+            self.ui.write_log(f"Jarvis: {answer}")
+            threading.Thread(target=_tts.speak, args=(answer, self.ui), daemon=True).start()
+            return True
         return False
 
     # ------------------------------------------------------------------
@@ -616,8 +646,19 @@ class SafeJarvis:
         parts.append(sys_prompt)
         full_system = "\n\n".join(parts)
 
+        # 성공했던 모델을 맨 앞에 — 매 요청마다 404 후보를 다시 돌지 않는다.
+        candidates = list(self._MODEL_CANDIDATES)
+        if self._preferred_model:
+            candidates = [self._preferred_model] + [
+                c for c in candidates if c != self._preferred_model
+            ]
+
         last_error = None
-        for model_name in self._MODEL_CANDIDATES:
+        tried_discovery = False
+        i = 0
+        while i < len(candidates):
+            model_name = candidates[i]
+            i += 1
             try:
                 self.ui.write_log(f"SYS: Gemini model - {model_name}")
                 model = self._get_model(full_system, model_name)
@@ -625,11 +666,19 @@ class SafeJarvis:
                     history_snapshot = list(self._history)
                 chat = model.start_chat(history=history_snapshot)
                 self._run_completion_loop(chat, text)
+                self._preferred_model = model_name
                 return
             except Exception as e:
                 last_error = e
                 if self._is_model_not_found_error(e):
                     self.ui.write_log(f"SYS: Gemini model unavailable - {model_name}; trying next")
+                    # 후보가 전부 404였으면 API 에서 사용 가능한 모델을 동적 탐색
+                    if i == len(candidates) and not tried_discovery:
+                        tried_discovery = True
+                        dyn = self._discover_flash_model()
+                        if dyn and dyn not in candidates:
+                            self.ui.write_log(f"SYS: Gemini model auto-discovered - {dyn}")
+                            candidates.append(dyn)
                     continue
                 self.ui.write_log(f"ERR: {str(e)[:200]}")
                 traceback.print_exc()
@@ -642,6 +691,25 @@ class SafeJarvis:
             traceback.print_exception(type(last_error), last_error, last_error.__traceback__)
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
+
+    def _discover_flash_model(self) -> str | None:
+        """list_models 로 generateContent 지원 모델을 찾아 flash 계열 우선 반환."""
+        try:
+            names = [
+                m.name.removeprefix("models/")
+                for m in genai.list_models()
+                if "generateContent" in getattr(m, "supported_generation_methods", [])
+            ]
+            for name in names:
+                low = name.lower()
+                if "flash" in low and not any(
+                    x in low for x in ("lite", "image", "tts", "audio", "live", "embedding")
+                ):
+                    return name
+            return names[0] if names else None
+        except Exception as e:
+            print(f"[Gemini] list_models failed: {e}")
+            return None
 
     def _send_with_retry(self, chat, payload, max_retries: int = 3):
         """429 quota exceeded 시 대기 후 재시도."""
@@ -788,7 +856,16 @@ class SafeJarvis:
         env["PYTHONUTF8"] = "1"
 
         # --- Popen: stream [pipeline] lines to UI in real-time ---------------
-        _PIPELINE_TIMEOUT = 1800  # 30 min hard limit (same as before)
+        # 한도는 파이프라인 자체 설정과 일치시킨다: 단계당 timeout × 단계 수 + 여유.
+        # (이전의 30분 고정 한도는 단계당 30분을 허용하는 파이프라인 설정과 모순 —
+        #  정상 진행 중인 긴 작업을 중간에 죽였음.)
+        try:
+            _pcfg = json.loads(PIPELINE_CONFIG.read_text(encoding="utf-8"))
+            _step_timeout = int(_pcfg.get("execution", {}).get("timeout_seconds", 1800))
+            _n_steps = len(_pcfg.get("steps", [])) or 7
+        except Exception:
+            _step_timeout, _n_steps = 1800, 7
+        _PIPELINE_TIMEOUT = _step_timeout * _n_steps + 300
 
         stderr_lines: list[str] = []
         rc = -1

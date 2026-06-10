@@ -15,7 +15,7 @@ safe_jarvis is a Windows AI development assistant with two parts:
 |---|---|
 | 🎙 **3 input modes** | Double-clap, voice, or text |
 | 🤖 **Dual-agent review** | Claude implements → Codex reviews → Claude fixes → Codex final check |
-| 🧠 **Gemini brain** | `gemini-2.5-flash` (with fallback) routes commands to the right tool |
+| 🧠 **Gemini brain** | Flash-model auto-selection (candidate list → 404 fallback → runtime `list_models` discovery) routes commands to the right tool |
 | 🔒 **Safe mode** | No file deletion, no browser hijack, no silent commits/pushes |
 | 📋 **Full audit trail** | Every step saved to `.project-ai/*.md` + raw run logs |
 
@@ -30,7 +30,7 @@ User (clap / voice / text)
   JARVIS UI (PyQt6)
         │
         ▼
-  Gemini (gemini-2.5-flash) ── tool calls ──► open_app / web_search / weather / reminder / ...
+  Gemini (auto-selected flash model) ── tool calls ──► open_app / web_search / weather / reminder / ...
         │
         └──► start_dual_agent_task
                     │
@@ -153,6 +153,11 @@ safe_jarvis deliberately removes dangerous capabilities:
 
 The pipeline also enforces `allowed_base_path` — any path outside that folder is blocked immediately.
 
+> **Enforcement levels** (be honest about what is a hard block vs. an instruction):
+> - **Orchestrator-enforced (hard):** `allowed_base_path` — out-of-bounds project paths are rejected before anything runs.
+> - **Sandbox-enforced (hard):** Codex review steps run `codex exec -s read-only`; only the final check gets `workspace-write` (to run build/tests).
+> - **Deny-rules + prompt (soft):** Claude edit steps run with `--permission-mode bypassPermissions`. Destructive commands (`rm`, `Remove-Item`, `git push`, …) are blocked via `--disallowedTools` deny rules, and `blocked_files` / `blocked_actions` from the config are injected into every step prompt — but this is not an OS-level sandbox.
+
 See [`AGENTS.md`](AGENTS.md) for the full rule set.
 
 ---
@@ -181,7 +186,7 @@ See [`AGENTS.md`](AGENTS.md) for the full rule set.
 
 ## Based On
 
-- [FatihMakes/Mark-XXXIX](https://github.com/FatihMakes/Mark-XXXIX) — original voice assistant UI (Gemini Live API version). safe_jarvis replaces the Gemini Live core with a listen-then-respond pattern, switches to `gemini-2.5-flash` (auto-fallback to available models) + Google STT, removes dangerous tools, and adds the dual-agent pipeline.
+- [FatihMakes/Mark-XXXIX](https://github.com/FatihMakes/Mark-XXXIX) — original voice assistant UI (Gemini Live API version). safe_jarvis replaces the Gemini Live core with a listen-then-respond pattern, switches to an auto-selected Gemini flash model + Google STT, removes dangerous tools, and adds the dual-agent pipeline.
 
 ---
 

@@ -78,10 +78,33 @@ def _normalize(raw: str) -> str:
 
     return raw  
 
+def _winreg_app_path(app_name: str) -> str | None:
+    """레지스트리 App Paths 에서 설치 경로 조회.
+
+    chrome, firefox, winword 등 GUI 앱 대부분은 PATH 에 없지만
+    HKLM/HKCU\\...\\App Paths\\<name>.exe 에 전체 경로가 등록돼 있다.
+    """
+    import winreg
+    exe = app_name if app_name.lower().endswith(".exe") else app_name + ".exe"
+    subkey = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}"
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(root, subkey) as k:
+                path, _ = winreg.QueryValueEx(k, None)
+            path = os.path.expandvars(str(path)).strip('"')
+            if path and os.path.exists(path):
+                return path
+        except OSError:
+            continue
+    return None
+
+
 def _launch_windows(app_name: str) -> bool:
     # Resolve to an absolute path first; never pass raw user/model string to
     # shell=True — that allows shell injection (e.g. "calc.exe & del /f ...").
-    exe = shutil.which(app_name) or shutil.which(app_name.split(".")[0])
+    exe = (shutil.which(app_name)
+           or shutil.which(app_name.split(".")[0])
+           or _winreg_app_path(app_name))
     if exe:
         try:
             subprocess.Popen(
@@ -104,20 +127,16 @@ def _launch_windows(app_name: str) -> bool:
         except Exception:
             pass
 
+    # 마지막 수단: 쉘 연결(등록된 앱/문서 이름)으로 시도. os.startfile 은
+    # cmd.exe 를 거치지 않으므로 인젝션 위험이 없다.
+    # (이전의 pyautogui 시작 메뉴 타이핑 폴백은 safe-mode 원칙 —
+    #  키보드 입력 시뮬레이션 금지 — 에 따라 제거했다.)
     try:
-        import pyautogui
-        pyautogui.PAUSE = 0.1
-        pyautogui.press("win")
-        time.sleep(0.7)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.9)
-        pyautogui.press("enter")
-        time.sleep(2.5)
+        os.startfile(app_name)
+        time.sleep(1.0)
         return True
-    except Exception as e:
-        print(f"[open_app] Start Menu search failed: {e}")
-
-    return False
+    except OSError:
+        return False
 
 
 def _launch_macos(app_name: str) -> bool:
@@ -157,18 +176,7 @@ def _launch_macos(app_name: str) -> bool:
         except Exception:
             pass
 
-    try:
-        import pyautogui
-        pyautogui.hotkey("command", "space")
-        time.sleep(0.6)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.8)
-        pyautogui.press("enter")
-        time.sleep(1.5)
-        return True
-    except Exception as e:
-        print(f"[open_app] Spotlight failed: {e}")
-
+    # (이전의 pyautogui Spotlight 타이핑 폴백은 safe-mode 원칙에 따라 제거.)
     return False
 
 

@@ -17,6 +17,9 @@ config/api_keys.json
 secrets.json
 credentials.json
 
+# 장기 기억 (이름·관계 등 개인정보 저장 파일 — 절대 커밋 금지)
+memory/long_term.json
+
 # Python
 __pycache__/
 *.pyc

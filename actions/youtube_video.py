@@ -9,7 +9,6 @@ from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote_plus
 
-import pyautogui
 import numpy as np
 
 try:
@@ -24,8 +23,6 @@ try:
 except ImportError:
     _TRANSCRIPT_OK = False
 
-from config import get_os, is_windows, is_mac, is_linux
-
 
 def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -35,6 +32,26 @@ def _get_base_dir() -> Path:
 
 BASE_DIR        = _get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
+
+
+def _get_os() -> str:
+    try:
+        cfg = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+        return cfg.get("os_system", "windows").lower()
+    except Exception:
+        return "windows"
+
+
+def is_windows() -> bool:
+    return _get_os() == "windows"
+
+
+def is_mac() -> bool:
+    return _get_os() == "mac"
+
+
+def is_linux() -> bool:
+    return _get_os() not in ("windows", "mac")
 
 HEADERS = {
     "User-Agent": (
@@ -124,14 +141,20 @@ def _ask_for_url(prompt_text: str = "YouTube video URL:") -> str | None:
         return None
 
 
+def _snippet_text(entry) -> str:
+    # youtube-transcript-api 1.x returns FetchedTranscriptSnippet objects;
+    # older versions returned dicts.
+    return entry["text"] if isinstance(entry, dict) else entry.text
+
+
 def _get_transcript(video_id: str) -> str | None:
     if not _TRANSCRIPT_OK:
         return None
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript_list = YouTubeTranscriptApi().list(video_id)
         transcript      = None
 
-        lang_priority = ["en", "tr", "de", "fr", "es", "it", "pt", "ru", "ja", "ko", "ar", "zh"]
+        lang_priority = ["ko", "en", "ja", "de", "fr", "es", "it", "pt", "ru", "ar", "zh"]
 
         try:
             transcript = transcript_list.find_manually_created_transcript(lang_priority)
@@ -150,7 +173,7 @@ def _get_transcript(video_id: str) -> str | None:
             return None
 
         fetched = transcript.fetch()
-        return " ".join(entry["text"] for entry in fetched)
+        return " ".join(_snippet_text(entry) for entry in fetched)
 
     except Exception as e:
         print(f"[YouTube] ⚠️ Transcript fetch failed: {e}")

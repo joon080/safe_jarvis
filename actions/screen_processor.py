@@ -72,6 +72,11 @@ def _get_api_key() -> str:
 def _get_os() -> str:
     return _load_config().get("os_system", "windows").lower()
 
+# Set while vision audio is playing through the speakers, so main.py's
+# clap/wake listeners can ignore the mic (speaker → mic feedback would
+# otherwise re-trigger detection).
+PLAYING = threading.Event()
+
 _LIVE_MODEL         = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 _CHANNELS           = 1
 _RECEIVE_SAMPLE_RATE = 24_000
@@ -220,6 +225,7 @@ class _VisionSession:
                     self._player = player
                 return
             self._player = player
+            self._ready_evt.clear()   # 이전 세션의 stale ready 상태 제거
             self._thread = threading.Thread(
                 target=self._run_event_loop,
                 daemon=True,
@@ -269,8 +275,10 @@ class _VisionSession:
             ),
         )
 
-        backoff = 2.0
+        backoff  = 2.0
+        failures = 0
         while True:
+            connected = False
             try:
                 print("[Vision] 🔌 Connecting...")
                 async with client.aio.live.connect(
@@ -278,7 +286,9 @@ class _VisionSession:
                 ) as session:
                     self._session = session
                     self._ready_evt.set()
-                    backoff = 2.0  
+                    connected = True
+                    backoff   = 2.0
+                    failures  = 0
                     print("[Vision] ✅ Connected")
 
                     async with asyncio.TaskGroup() as tg:
@@ -293,10 +303,17 @@ class _VisionSession:
                 self._session = None
                 self._ready_evt.clear()
 
+            if not connected:
+                failures += 1
+                if failures >= 5:
+                    # 무한 재연결로 쿼터를 태우지 않는다. 스레드를 종료하면
+                    # 다음 screen_process 호출 때 start()가 새로 시작한다.
+                    print("[Vision] ❌ 연결 5회 연속 실패 — 세션 종료 (다음 요청 시 재시도)")
+                    return
+
             print(f"[Vision] 🔄 Reconnecting in {backoff:.0f}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 1.5, 30.0)
-            self._ready_evt.set()  
 
     async def _send_loop(self) -> None:
         while True:
@@ -358,27 +375,29 @@ class _VisionSession:
         try:
             while True:
                 chunk = await self._audio_in.get()
-                await asyncio.to_thread(stream.write, chunk)
+                PLAYING.set()
+                try:
+                    await asyncio.to_thread(stream.write, chunk)
+                finally:
+                    if self._audio_in.empty():
+                        PLAYING.clear()
         except Exception as e:
             print(f"[Vision] ❌ Play error: {e}")
             raise
         finally:
+            PLAYING.clear()
             stream.stop()
             stream.close()
 
 _session      = _VisionSession()
 _session_lock = threading.Lock()
-_session_up   = False
 
 
 def _ensure_session(player=None) -> None:
-    global _session_up
+    # start()가 스레드 생존 여부를 직접 확인하므로 별도 플래그를 두지 않는다.
+    # (플래그 방식은 세션 스레드가 죽은 뒤 재시작이 영영 안 되는 버그가 있었음.)
     with _session_lock:
-        if not _session_up:
-            _session.start(player=player)
-            _session_up = True
-        elif player is not None:
-            _session._player = player
+        _session.start(player=player)
 
 
 def screen_process(

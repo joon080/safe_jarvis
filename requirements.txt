@@ -38,5 +38,5 @@ duckduckgo-search>=6.0
 mss>=9.0
 opencv-python>=4.9
 
-# YouTube 요약 (선택)
-youtube-transcript-api>=0.6
+# YouTube 요약 (선택) — 1.x 인스턴스 API(.list/.fetch) 기준으로 코드 작성됨
+youtube-transcript-api>=1.0,<2
